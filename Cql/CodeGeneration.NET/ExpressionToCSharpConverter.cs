@@ -10,6 +10,7 @@ using Hl7.Cql.Compiler.Expressions;
 using Microsoft.CodeAnalysis.CSharp;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Linq.Expressions;
@@ -19,12 +20,14 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Hl7.Cql.Abstractions.Infrastructure;
 using Microsoft.Extensions.Options;
+using static System.FormattableString;
 
 namespace Hl7.Cql.CodeGeneration.NET
 {
     internal class ExpressionToCSharpConverter(
         IOptions<CSharpCodeWriterOptions> csharpCodeWriterOptions,
         TypeToCSharpConverter typeToCSharpConverter,
+        VariableNameGenerator nameGenerator,
         string libraryName)
     {
         public string LibraryName { get; } = libraryName;
@@ -61,6 +64,7 @@ namespace Hl7.Cql.CodeGeneration.NET
                     FunctionCallExpression fce            => ConvertFunctionCallExpression(indent, leadingIndentString, fce),
                     DefinitionCallExpression dce          => ConvertDefinitionCallExpression(leadingIndentString, dce),
                     ElmAsExpression ea                    => ConvertExpression(indent, ea.Reduce(), leadingIndent),
+                    ElmChoiceAsExpression cae             => ConvertChoiceAsExpression(cae, leadingIndentString),
                     _                                     => throw new NotSupportedException($"Don't know how to convert an expression of type {expression.GetType()} into C#."),
                 };
                 return result;
@@ -82,6 +86,44 @@ namespace Hl7.Cql.CodeGeneration.NET
                     */
                     """;
             }
+        }
+
+        private string ConvertChoiceAsExpression(ElmChoiceAsExpression cae, string leadingIndentString)
+        {
+            var sb = new StringBuilder();
+            sb.Append(Invariant( $$"""{{((ParameterExpression)cae.Expression).Name}} switch { null => null """));
+            HashSet<string> previousTypes = new();
+            foreach (var e in cae.SwitchCaseExpressions)
+            {
+                var convertExpressionParamType = _typeToCSharpConverter.ToCSharp(e.Type)
+                                                                       .TrimEnd('?') //Make non-nullable
+                                                                       ;
+                if (!previousTypes.Add(convertExpressionParamType))
+                {
+                    continue;
+                }
+                var convertExpressionParamName = nameGenerator.Next();
+                var convertExpression = ConvertExpression(0, e);
+                convertExpression = convertExpression.Replace(ElmChoiceAsExpression.SwitchCaseExpressionParamPlaceholderName, convertExpressionParamName);
+                sb.Append(Invariant($$""", {{convertExpressionParamType}} {{convertExpressionParamName}} => {{convertExpression}}"""));
+            }
+
+            if (cae.MissingConversionTypes.Any())
+                sb.Append("/* ");
+            foreach (var type in cae.MissingConversionTypes)
+            {
+                var convertExpressionParamType = _typeToCSharpConverter.ToCSharp(type);
+                sb.Append(Invariant($$""", {{convertExpressionParamType}} => ???"""));
+            }
+            if (cae.MissingConversionTypes.Any())
+                sb.Append(" */");
+
+            if (!previousTypes.Contains("object"))
+                sb.Append(Invariant($", _ => throw new {typeof(UnreachableException).FullName}()"));
+
+            sb.Append(" }");
+
+            return sb.ToString();
         }
 
         private string ConvertDefinitionCallExpression(string leadingIndentString, DefinitionCallExpression dce)
@@ -178,10 +220,10 @@ namespace Hl7.Cql.CodeGeneration.NET
                     Enum e when Enum.IsDefined(e.GetType(), e) => $"{e.GetType().FullName}.{e}", // 'e' will be the name of the defined enum
                     Enum e => $"({e.GetType().FullName}){e}", // 'e' will be the numeric value of the undefined enum
                     bool b => b ? "true" : "false",
-                    decimal d => FormattableString.Invariant($"{d}m"),
-                    int i => FormattableString.Invariant($"{i}"),
+                    decimal d => Invariant($"{d}m"),
+                    int i => Invariant($"{i}"),
                     var v when v.IsObjectNullOrDefault() => DefaultExpressionForType(),
-                    _ => FormattableString.Invariant($"{value}"),
+                    _ => Invariant($"{value}"),
                 };
             }
             else
@@ -194,7 +236,7 @@ namespace Hl7.Cql.CodeGeneration.NET
                     Type t                           => $"typeof({_typeToCSharpConverter.ToCSharp(t)})",
                     Uri u                            => $"new Uri(\"{u}\")",
                     string s                         => QuoteString(s),
-                    _                                => FormattableString.Invariant($"{value}")
+                    _                                => Invariant($"{value}")
                 };
             }
 

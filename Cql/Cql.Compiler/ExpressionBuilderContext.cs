@@ -17,6 +17,7 @@ using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Text;
 using System.Xml;
 using Hl7.Cql.Abstractions;
 using Hl7.Cql.Abstractions.Infrastructure;
@@ -37,6 +38,7 @@ using ListTypeSpecifier = Hl7.Cql.Elm.ListTypeSpecifier;
 using NamedTypeSpecifier = Hl7.Cql.Elm.NamedTypeSpecifier;
 using Tuple = Hl7.Cql.Elm.Tuple;
 using TupleTypeSpecifier = Hl7.Cql.Elm.TupleTypeSpecifier;
+using TypeExtensions = Hl7.Cql.Abstractions.Infrastructure.TypeExtensions;
 
 namespace Hl7.Cql.Compiler;
 
@@ -50,7 +52,7 @@ namespace Hl7.Cql.Compiler;
 /// </remarks>
 partial class ExpressionBuilderContext(
     ILogger<ExpressionBuilder> logger,
-    ExpressionBuilderSettings expressionBuilderSettings,
+    ExpressionBuilderOptions expressionBuilderOptions,
     CqlOperatorsBinder cqlOperatorsBinder,
     TupleBuilderCache tupleBuilderCache,
     TypeResolver typeResolver,
@@ -60,7 +62,7 @@ partial class ExpressionBuilderContext(
     )
 {
     private readonly ILogger<ExpressionBuilder> _logger = logger;
-    private readonly ExpressionBuilderSettings _expressionBuilderSettings = expressionBuilderSettings;
+    private readonly ExpressionBuilderOptions _expressionBuilderOptions = expressionBuilderOptions;
     private readonly CqlOperatorsBinder _cqlOperatorsBinder = cqlOperatorsBinder;
     private readonly TupleBuilderCache _tupleBuilderCache = tupleBuilderCache;
     private readonly TypeResolver _typeResolver = typeResolver;
@@ -2116,93 +2118,127 @@ partial class ExpressionBuilderContext
 {
     protected Expression As(As @as) //@ TODO: Cast - As
     {
-        if (@as.operand is List list)
-        {
-            using (PushElement(list))
-            {
-                // create new ListType[0]; instead of new object[0] as IEnumerable<object> as IEnumerable<ListType>;
-                if ((list.element?.Length ?? 0) == 0)
-                {
-                    var type = TypeFor(@as.asTypeSpecifier!)!;
-                    if (_typeResolver.IsListType(type))
-                    {
-                        var listElementType = _typeResolver.GetListElementType(type) ??
-                                              throw this.NewExpressionBuildingException(
-                                                  $"{type} was expected to be a list type.");
-                        var newArray = Expression.NewArrayBounds(listElementType, Expression.Constant(0));
-                        var elmAs = new ElmAsExpression(newArray, type, @as.strict);
-                        return elmAs;
-                    }
-                    else if (type == _typeResolver.AnyType) // handles untyped empty lists whose type is Any
-                    {
-                        var newArray = Expression.NewArrayBounds(_typeResolver.AnyType, Expression.Constant(0));
-                        var elmAs = new ElmAsExpression(newArray, type, @as.strict);
-                        return elmAs;
-                    }
-
-                    throw this.NewExpressionBuildingException(
-                        "Cannot use as operator on a list if the as type is not also a list type.");
-                }
-            }
-        }
-
+        using var _ = PushElement(@as.operand);
         // asTypeSpecifier is an expression with its own resulttypespecifier that actually contains the real type
-        if (@as.asTypeSpecifier != null)
+        var asTypeSpecifier = (@as switch
+                                  {
+                                      { asTypeSpecifier: { } s, asType: null } => s,
+                                      { asType: { } t }                        => t.ToNamedType(),
+                                      _                                        => null,
+                                  }) ?? throw this.NewExpressionBuildingException("The 'as' operator has no type name.");
+        var type = TypeFor(asTypeSpecifier!)!;
+
+        switch (@as.operand)
         {
-            using (PushElement(@as.asTypeSpecifier))
+            // create new ListType[0]; instead of new object[0] as IEnumerable<object> as IEnumerable<ListType>;
+            case List list when (list.element?.Length ?? 0) == 0:
             {
-                if (@as.operand is Null)
+                if (_typeResolver.IsListType(type))
                 {
-                    var type = TypeFor(@as.asTypeSpecifier!)!;
-                    var defaultExpression = Expression.Default(type);
-                    return new ElmAsExpression(defaultExpression, type, @as.strict);
+                    var listElementType = _typeResolver.GetListElementType(type) ??
+                                          throw this.NewExpressionBuildingException(
+                                              $"{type} was expected to be a list type.");
+                    var newArray = Expression.NewArrayBounds(listElementType, Expression.Constant(0));
+                    var elmAs = new ElmAsExpression(newArray, type, @as.strict);
+                    return elmAs;
                 }
-                else
+                else if (type == _typeResolver.AnyType) // handles untyped empty lists whose type is Any
                 {
-                    var type = TypeFor(@as.asTypeSpecifier!)!;
-                    var operand = TranslateArg(@as.operand!);
-                    var converted = ChangeType(operand, type, out var typeConversion, considerSafeUpcast:true);
-                    switch (typeConversion)
-                    {
-                        case TypeConversion.NoMatch:
-                            // log an unsafe cast
-                            _logger.LogWarning(
-                                FormatMessage(
-                                    $"{operand.Type.ToCSharpString(Defaults.TypeCSharpFormat)} as {type.ToCSharpString(Defaults.TypeCSharpFormat)} will always result in null.",
-                                    @as.operand));
-                            return Expression.Default(type);
-
-                        case TypeConversion.OperatorConvert:
-                            return converted;
-
-                        case TypeConversion.ExpressionTypeAs:
-                        default:
-                            return new ElmAsExpression(operand, type, @as.strict);
-                    }
+                    var newArray = Expression.NewArrayBounds(_typeResolver.AnyType, Expression.Constant(0));
+                    var elmAs = new ElmAsExpression(newArray, type, @as.strict);
+                    return elmAs;
                 }
+
+                throw this.NewExpressionBuildingException(
+                    "Cannot use as operator on a list if the as type is not also a list type.");
+            }
+            case Null:
+            {
+                var defaultExpression = Expression.Default(type);
+                return defaultExpression;
+            }
+            case { } op when op.GetTypeSpecifier() is ChoiceTypeSpecifier operandChoiceTypeSpecifier:
+            {
+                var operand = TranslateArg(op);
+                return ChangeTypeOnChoice(operand, operandChoiceTypeSpecifier, type, @as.strict);
+            }
+            case { } op:
+            {
+                var operand = TranslateArg(op);
+                var converted = ChangeType(operand, type, out var typeConversion, considerSafeUpcast:true);
+                switch (typeConversion)
+                {
+                    case TypeConversion.NoMatch:
+                        // log an unsafe cast
+                        _logger.LogWarning(
+                            FormatMessage(
+                                $"{operand.Type.ToCSharpString(Defaults.TypeCSharpFormat)} as {type.ToCSharpString(Defaults.TypeCSharpFormat)} will always result in null.",
+                                @as.operand));
+                        return Expression.Default(type);
+
+                    case TypeConversion.OperatorConvert:
+                        return converted;
+
+                    case TypeConversion.ExpressionTypeAs:
+                    default:
+                        return new ElmAsExpression(operand, type, @as.strict);
+                }
+            }
+            default: throw new UnreachableException(); // The above switch should cover all cases.
+        }
+
+    }
+
+    private Expression ChangeTypeOnChoice(Expression operand, ChoiceTypeSpecifier operandChoiceTypeSpecifier, Type toType, bool strict)
+    {
+        Debug.Assert(operand.Type == typeof(object));
+        var expressionChoiceTypes =
+            operandChoiceTypeSpecifier.choice
+                                      .Select(ts => TypeFor(ts) switch
+                                      {
+                                          Type t => Nullable.GetUnderlyingType(t) ?? t, // Nullable types are unwrapped
+                                          _ => throw new UnreachableException()
+                                      });
+
+        StringBuilder sbError = new();
+        List<Type> missingConversionTypes = new();
+        var caseExpressions = expressionChoiceTypes
+                              .Select(type =>
+                                {
+                                    ParameterExpression parameter = Expression.Parameter(type , ElmChoiceAsExpression.SwitchCaseExpressionParamPlaceholderName);
+                                    Expression body = ChangeType(parameter, toType, out var conversion);
+                                    if (conversion == TypeConversion.NoMatch)
+                                    {
+                                        missingConversionTypes.Add(type);
+                                        sbError.Append(FormattableString.Invariant($"\n- {type.ToCSharpString()} to {toType.ToCSharpString()}"));
+                                        return null;
+                                    }
+                                    return body;
+                                })
+                              .OfType<Expression>()
+                              .ToArray();
+
+        if (missingConversionTypes.Any())
+        {
+            if (_expressionBuilderOptions.IgnoreMissingChoiceSwitchCaseConversions)
+            {
+                _logger.LogWarning(
+                    FormatMessage(
+                        $"Could not resolve on or more case expressions for Choice type {operandChoiceTypeSpecifier}.\nThese conversions could not be resolved:{sbError}\n{DebuggerView}",
+                        operandChoiceTypeSpecifier));
+            }
+            else
+            {
+                throw this.NewExpressionBuildingException(
+                    $"Could not resolve on or more case expressions for Choice type {operandChoiceTypeSpecifier}.\nThese conversions could not be resolved:{sbError}");
             }
         }
 
+        var elmChoiceAsExpression = new ElmChoiceAsExpression(operand, caseExpressions, toType, strict)
         {
-            if (string.IsNullOrWhiteSpace(@as.asType.Name))
-                throw this.NewExpressionBuildingException("The 'as' operator has no type name.");
-
-            if (@as.operand is null)
-                throw this.NewExpressionBuildingException("Operand cannot be null");
-
-            var type = _typeResolver.ResolveType(@as.asType.Name!)
-                       ?? throw this.NewExpressionBuildingException($"Cannot resolve type {@as.asType.Name}");
-
-            var operand = TranslateArg(@as.operand);
-            if (!type.IsAssignableTo(operand.Type))
-            {
-                _logger.LogWarning(FormatMessage(
-                                       $"Potentially unsafe cast from {operand.Type.ToCSharpString(Defaults.TypeCSharpFormat)} to type {type.ToCSharpString(Defaults.TypeCSharpFormat)}",
-                                       @as.operand));
-            }
-
-            return new ElmAsExpression(operand, type, @as.strict);
-        }
+            MissingConversionTypes = missingConversionTypes.ToArray(),
+        };
+        return elmChoiceAsExpression;
     }
 
     protected Expression Is(Is @is) // @TODO: Cast - Is

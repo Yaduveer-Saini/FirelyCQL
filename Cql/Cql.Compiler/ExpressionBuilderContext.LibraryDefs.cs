@@ -171,7 +171,7 @@ partial class ExpressionBuilderContext
 
                     if (function?.external ?? false)
                     {
-                        if (_expressionBuilderSettings.AllowUnresolvedExternals)
+                        if (_expressionBuilderOptions.AllowUnresolvedExternals)
                         {
                             var returnType = TypeFor(expressionDef)!;
                             var funcOps = function.operand ?? Array.Empty<OperandDef>();
@@ -264,7 +264,7 @@ partial class ExpressionBuilderContext
 
                 var resolveParam = _cqlContextBinder.ResolveParameter(_libraryContext.LibraryVersionedIdentifier, parameter.name, defaultValue);
 
-                var parameterType = TypeFor(parameter.parameterTypeSpecifier)!;
+                var parameterType = TypeFor(parameter.parameterTypeSpecifier ?? parameter.resultTypeSpecifier)!;
                 var cast = _cqlOperatorsBinder.CastToType(resolveParam, parameterType);
                 // e.g. (bundle, context) => context.Parameters["Measurement Period"]
                 var lambda = Expression.Lambda(cast, CqlExpressions.ParameterExpression);
